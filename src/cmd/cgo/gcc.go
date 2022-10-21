@@ -824,6 +824,14 @@ func (p *Package) rewriteCall(f *File, call *Call) (string, bool) {
 			break
 		}
 	}
+	for i, param := range params {
+		if p.needsPointerCheckOld(f, param.Go, args[i]) {
+			p.ptrchkCnt ++
+			if !p.needsPointerCheck(f, param.Go, args[i]) {
+				p.ptrchkFPCnt ++
+			}
+		}
+	}
 	if !any {
 		return "", false
 	}
@@ -978,10 +986,323 @@ func (p *Package) rewriteCall(f *File, call *Call) (string, bool) {
 	return sb.String(), needsUnsafe
 }
 
+func (p *Package) traceFuncType(f *File, call *ast.CallExpr) *ast.FuncType {
+	//TODO:f.Name的维护
+	switch fun := call.Fun.(type) {
+	case *ast.Ident:
+		for _, d := range p.Decl {
+			fd, ok := d.(*ast.FuncDecl)
+			if ok && fd.Name.Name == fun.Name {
+				return fd.Type
+			}
+		}
+	case *ast.SelectorExpr:
+		if l, ok := fun.X.(*ast.Ident); ok && l.Name == "C" {
+			if f != nil {
+				name := f.Name[fun.Sel.Name]
+				if name != nil && name.Kind == "func" && name.FuncType != nil && name.FuncType.Go != nil {
+					return name.FuncType.Go
+				}
+			}
+		}
+	}
+	return nil
+}
+
+//support identifier and slice(array)
+//TODO:support struct, composite lit(slice, struct)
+//TODO:原先的缺陷、新的策略、改动是否正确、画图
+//TODO:SANER 整体蓝图
+//TODO:support struct field, refs < 0
+func (p *Package) traceArgType(f *File, arg ast.Expr) ast.Expr {
+	if arg == nil {
+		return nil
+	}
+	
+	switch arg := arg.(type) {
+	case *ast.ParenExpr:
+		return p.traceArgType(f, arg.X)
+	case *ast.Ident:
+		obj := arg.Obj
+
+		if obj == nil {
+			return nil
+		}
+
+		if obj.Decl == nil {
+			return nil
+		}
+
+		switch decl := obj.Decl.(type) {
+		case *ast.Field:
+			return decl.Type
+		case *ast.ValueSpec:
+			return decl.Type
+		case *ast.AssignStmt:
+			j := 0 // index in multi-return CallExpr
+			k := 0 // index in decl.Rhs
+			l := 0 // index in range
+			var call *ast.FuncType = nil
+			var rangeTyp ast.Expr = nil
+			for _, lhs := range decl.Lhs {
+				//before loop
+				if k >= len(decl.Rhs) {
+					break
+				}
+				rhs := decl.Rhs[k]
+
+				if rangeTyp == nil { 
+					if rhs, ok := rhs.(*ast.UnaryExpr); ok && rhs.Op == token.RANGE {
+						if rangeTyp = p.traceArgType(f, rhs.X); rangeTyp == nil {
+							break
+						}
+						l = 0
+					}
+				}
+				
+				if call == nil {
+					if rhs, ok := rhs.(*ast.CallExpr); ok {
+						if call = p.traceFuncType(f, rhs); call == nil {
+							if id, ok := rhs.Fun.(*ast.Ident); ok && (id.Name == "make" || id.Name == "new") {
+								//special builtin function
+								if lhs, ok := lhs.(*ast.Ident); ok && lhs.Obj == obj {
+									return rhs.Args[0]
+								}
+								goto loop_end //continue
+							}
+							//can not figure out
+							break
+						}
+						j = 0
+					}
+				}
+
+				if lhs, ok := lhs.(*ast.Ident); ok && lhs.Obj == obj {
+					if call != nil {
+						return call.Results.List[j].Type
+					} else if rangeTyp != nil {
+						return p.traceRangeType(f, rangeTyp, l)
+					} else {
+						return p.traceArgType(f, rhs)
+					}
+				}
+
+loop_end:
+				if call != nil {
+					j ++
+					if j >= len(call.Results.List) {
+						call = nil
+						j = 0
+						k ++
+					}
+				} else if rangeTyp != nil {
+					l ++
+					if _, ok := rangeTyp.(*ast.ChanType); ok || l >= 2 {
+						rangeTyp = nil
+						l = 0
+						k ++
+					}
+				} else {
+					k ++
+				}
+			}
+		}
+		return nil
+	case *ast.BasicLit:
+		switch arg.Kind {
+		//FIXME:length
+		case token.INT:
+			return ast.NewIdent("int64")
+		case token.FLOAT:
+			return ast.NewIdent("float64")
+		case token.IMAG:
+			return ast.NewIdent("complex128")
+		case token.CHAR:
+			return ast.NewIdent("rune")
+		case token.STRING:
+			return ast.NewIdent("string")
+		}
+		return nil
+	case *ast.CompositeLit:
+		return arg.Type
+	case *ast.CallExpr:
+		//multi-return handled only in case 'AssignStmt'
+		funcTyp := p.traceFuncType(f, arg)
+		if funcTyp != nil && len(funcTyp.Results.List) == 1 {
+			return funcTyp.Results.List[0].Type
+		} 
+		if id, ok := arg.Fun.(*ast.Ident); ok && (id.Name == "make" || id.Name == "new") {
+			return arg.Args[0]
+		}
+		return nil
+	case *ast.SelectorExpr:
+		xTyp := p.traceArgType(f, arg.X)
+		if xTyp != nil {
+			if se, ok := xTyp.(*ast.StarExpr); ok {
+				xTyp = se.X
+			}
+			if se, ok := xTyp.(*ast.SelectorExpr); ok {
+				if l, ok := se.X.(*ast.Ident); ok && l.Name == "C" {
+					if f == nil {
+						return nil
+					}
+					name := f.Name[se.Sel.Name]
+					if name != nil && name.Kind == "type" && name.Type != nil && name.Type.Go != nil {
+						xTyp = name.Type.Go
+					}
+				}
+			}
+			if id, ok := xTyp.(*ast.Ident); ok {
+				xTyp = p.traceTypeDecl(f, id)
+			} 
+			if st, ok := xTyp.(*ast.StructType); ok {
+				sel := arg.Sel
+				for _, field := range st.Fields.List {
+					for _, name := range field.Names {
+						if sel.Name == name.Name {
+							return field.Type
+						}
+					}
+				} 
+			}
+		}
+		return nil
+	case *ast.UnaryExpr:
+		xTyp := p.traceArgType(f, arg.X)
+		if xTyp != nil {
+			switch arg.Op {
+			case token.AND:
+				return &ast.StarExpr{X:xTyp}
+			case token.MUL:
+				if xTyp, ok := xTyp.(*ast.StarExpr); ok {
+					return xTyp.X
+				}
+			case token.ADD, token.SUB:
+				return xTyp
+			}
+		}
+		return nil
+	case *ast.IndexExpr:
+		xTyp := p.traceArgType(f, arg.X)
+		if xTyp != nil {
+			if at, ok := xTyp.(*ast.ArrayType); ok {
+				return at.Elt
+			}
+		}
+		return nil
+	}
+
+	return nil
+}
+
+func (p *Package) traceRangeType(f *File, rangeTyp ast.Expr, l int) ast.Expr {
+	if rangeTyp == nil {
+		return nil
+	}
+
+	switch rangeTyp := rangeTyp.(type) {
+	case *ast.ArrayType:
+		if l == 0 {
+			return ast.NewIdent("int64")
+		} 
+		if l == 1 {
+			return rangeTyp.Elt
+		}
+	case *ast.MapType:
+		if l == 0 {
+			return rangeTyp.Key
+		} 
+		if l == 1 {
+			return rangeTyp.Value
+		}
+	case *ast.ChanType:
+		if l == 0 {
+			return rangeTyp.Value
+		}
+	case *ast.Ident:
+		if rangeTyp.Name == "string" {
+			if l == 0 {
+				return ast.NewIdent("int64")
+			} 
+			if l == 1 {
+				return ast.NewIdent("rune")
+			}
+		} else {
+			typ := p.traceTypeDecl(f, rangeTyp)
+			if typ != nil {
+				if tmp, ok := typ.(*ast.Ident); ok && tmp.Name != "string" {
+					return nil
+				}
+				return p.traceRangeType(f, typ, l)
+			}
+		}
+	}
+	return nil
+}
+
+func (p *Package) traceTypeDecl(f *File, t ast.Expr) ast.Expr {
+	if t, ok := t.(*ast.Ident); ok {
+		for _, d := range p.Decl {
+			gd, ok := d.(*ast.GenDecl)
+			if !ok || gd.Tok != token.TYPE {
+				continue
+			}
+			for _, spec := range gd.Specs {
+				ts, ok := spec.(*ast.TypeSpec)
+				if !ok {
+					continue
+				}
+				if ts.Name.Name == t.Name {
+					return p.traceTypeDecl(f, ts.Type)
+				}
+			}
+		}
+		if def := typedef[t.Name]; def != nil {
+			return p.traceTypeDecl(f, def.Go)
+		}
+	}
+	return t
+}
+
+func (p *Package) isUnsafeArg(arg ast.Expr) *ast.CallExpr {
+	switch arg := arg.(type) {
+	case *ast.CallExpr:
+		if fun, ok := arg.Fun.(*ast.SelectorExpr); ok && fun.Sel.Name == "Pointer" {
+			if x, ok := fun.X.(*ast.Ident); ok && x.Name == "unsafe" {
+				return arg
+			} 
+		}
+	case *ast.ParenExpr:
+		return p.isUnsafeArg(arg.X)
+	}
+	return nil
+}
+
 // needsPointerCheck reports whether the type t needs a pointer check.
 // This is true if t is a pointer and if the value to which it points
 // might contain a pointer.
 func (p *Package) needsPointerCheck(f *File, t ast.Expr, arg ast.Expr) bool {
+	// An untyped nil does not need a pointer check, and when
+	// _cgoCheckPointer returns the untyped nil the type assertion we
+	// are going to insert will fail.  Easier to just skip nil arguments.
+	// TODO: Note that this fails if nil is shadowed.
+	if id, ok := arg.(*ast.Ident); ok && id.Name == "nil" {
+		return false
+	}
+
+	if t, ok := t.(*ast.Ident); ok && t.Name == "unsafe.Pointer" {
+		if unsafeArg := p.isUnsafeArg(arg); unsafeArg != nil {
+			if typ := p.traceArgType(f, unsafeArg.Args[0]); typ != nil {
+				return p.hasPointer(f, typ, true)				
+			}
+		}
+	}
+
+	return p.hasPointer(f, t, true)
+}
+
+//original pointer check
+func (p *Package) needsPointerCheckOld(f *File, t ast.Expr, arg ast.Expr) bool {
 	// An untyped nil does not need a pointer check, and when
 	// _cgoCheckPointer returns the untyped nil the type assertion we
 	// are going to insert will fail.  Easier to just skip nil arguments.
@@ -1076,6 +1397,8 @@ func (p *Package) hasPointer(f *File, t ast.Expr, top bool) bool {
 		// We can't figure out the type. Conservative
 		// approach is to assume it has a pointer.
 		return true
+	case *ast.ParenExpr:
+		return p.hasPointer(f, t.X, top)
 	default:
 		error_(t.Pos(), "could not understand type %s", gofmt(t))
 		return true

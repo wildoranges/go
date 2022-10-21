@@ -50,6 +50,8 @@ type Package struct {
 	Preamble    string          // collected preamble for _cgo_export.h
 	typedefs    map[string]bool // type names that appear in the types of the objects we're interested in
 	typedefList []typedefInfo
+	ptrchkCnt	int
+	ptrchkFPCnt int
 }
 
 // A typedefInfo is an element on Package.typedefList: a typedef name
@@ -370,6 +372,11 @@ func main() {
 	}
 	*objDir += string(filepath.Separator)
 
+	for i := range goFiles { 
+		f := fs[i]
+		p.Decl = append(p.Decl, f.AST.Decls...)
+	}
+	
 	for i, input := range goFiles {
 		f := fs[i]
 		p.Translate(f)
@@ -393,6 +400,18 @@ func main() {
 			os.Stdout.WriteString(p.godefs(f))
 		} else {
 			p.writeOutput(f, input)
+		}
+	}
+
+	ptrDir := os.Getenv("PTR_RESULT_DIR")
+	if ptrDir != "" {
+		absPath, err := filepath.Abs(ptrDir)
+		if err != nil {
+			fatalf("%s", err)
+		}
+		err = os.WriteFile(filepath.Join(absPath, p.PackageName+".result"), []byte(fmt.Sprintf("pkg %s: ptrchk %d ptrchkFP %d\n", p.PackageName, p.ptrchkCnt, p.ptrchkFPCnt)), 0666)
+		if err != nil {
+			fatalf("%s", err)
 		}
 	}
 
@@ -473,7 +492,8 @@ func (p *Package) Record(f *File) {
 		p.ExpFunc = append(p.ExpFunc, f.ExpFunc...)
 		p.Preamble += "\n" + f.Preamble
 	}
-	p.Decl = append(p.Decl, f.AST.Decls...)
+	// record decl before translate
+	// p.Decl = append(p.Decl, f.AST.Decls...)
 }
 
 // incompleteTypedef reports whether t appears to be an incomplete
